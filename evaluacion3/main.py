@@ -1,15 +1,14 @@
-import json
-import requests
-import xml.etree.ElementTree as ET
-from typing import Any, Dict, Optional
-from hasheo import hash_password, verify_password
-import re
-import requests
-import oracledb
-import os
-from dotenv import load_dotenv
-from typing import Optional
 import datetime
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import bcrypt
+import oracledb
+import requests
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -51,7 +50,8 @@ class Database:
 class Auth:
     @staticmethod
     def login(db: Database, username: str, password: str):
-        # keep password as str; `verify_password` accepts str or bytes
+        password = password.encode("UTF-8")
+
         resultado = db.query(
             sql= "SELECT * FROM USERS WHERE username = :username",
             parameters={"username": username}
@@ -63,12 +63,12 @@ class Auth:
 
         # Stored password is hex string of the hashed bytes
         try:
-            hashed_hex = resultado[0][2]
+            hashed_password = bytes.fromhex(resultado[0][2])
         except Exception:
             print("Formato de contraseña inválido en la base de datos")
             return None
 
-        if verify_password(password, hashed_hex):
+        if bcrypt.checkpw(password, hashed_password):
             print("Logeado correctamente")
             # return user id if present
             try:
@@ -82,14 +82,15 @@ class Auth:
     @staticmethod
     def register(db: Database, id: int, username: str, password: str):
         print("registrando usuario")
-        # use hasheo.hash_password to produce hex string
-        hashed_hex = hash_password(password)
+        password = password.encode("UTF-8")
+        salt = bcrypt.gensalt(12)
+        hash_password = bcrypt.hashpw(password,salt)
 
         usuario = {
             "id": id,
             "username": username,
             # store as hex string to be safe across DB drivers
-            "password": hashed_hex
+            "password": hash_password.hex()
         }
 
         db.query(
@@ -99,9 +100,8 @@ class Auth:
         print("usuario registrado con exito")
 
     @staticmethod
-    def login_local(username: str, password: str):
-        """Login directo desde users.json"""
-        from pathlib import Path
+    def login_local(username: str, password: str) -> Optional[int]:
+        """Lee users.json y valida credenciales sin SQL"""
         try:
             store_path = Path(__file__).parent / "users.json"
             if not store_path.exists():
@@ -111,16 +111,21 @@ class Auth:
                 users = json.load(f)
             for u in users:
                 if u.get("username") == username:
-                    if verify_password(password, u.get("password", "")):
-                        print("Logeado correctamente")
-                        return int(u.get("id", 0))
-                    else:
-                        print("Contraseña incorrecta")
+                    try:
+                        hashed = bytes.fromhex(u.get("password", ""))
+                        if bcrypt.checkpw(password.encode("UTF-8"), hashed):
+                            print("Logeado correctamente")
+                            return int(u.get("id", 0))
+                        else:
+                            print("Contraseña incorrecta")
+                            return None
+                    except Exception as e:
+                        print(f"Error: {e}")
                         return None
             print("No hay coincidencias")
             return None
         except Exception as e:
-            print(f"Error en login: {e}")
+            print(f"Error: {e}")
             return None
 
 # Integración y manejo de APIs (3.1.2)
@@ -130,42 +135,135 @@ class Finance:
         self.base_url = base_url
     def get_indicator(self, indicator: str, fecha: str = None) -> float:
         try:
+            # Intento 1: solicitar con fecha (si fue entregada o hoy)
             if not fecha:
-                dd = datetime.datetime.now().day
-                mm = datetime.datetime.now().month
-                yyyy = datetime.datetime.now().year
-                fecha = f"{dd}-{mm}-{yyyy}"
-            url = f"{self.base_url}/{indicator}/{fecha}"
-            respuesta = requests.get(url).json()
-            return respuesta["serie"][0]["valor"]
-        except:
-            print("Hubo un error con la solicitud")
+                fecha = datetime.datetime.now().strftime("%Y-%m-%d")
+            url_with_date = f"{self.base_url}/{indicator}/{fecha}"
+            try:
+                respuesta = requests.get(url_with_date, timeout=10)
+                respuesta.raise_for_status()
+                data = respuesta.json()
+                print(f"[DEBUG] Respuesta completa para {indicator} en {fecha}: {data}")
+                serie = data.get("serie") or []
+                if serie:
+                    return serie[0].get("valor")
+            except Exception:
+                # si falla (500 u otro), continuar para intentar sin fecha
+                pass
+
+            # Intento 2: solicitar sin fecha (último valor disponible)
+            url = f"{self.base_url}/{indicator}"
+            try:
+                respuesta2 = requests.get(url, timeout=10)
+                respuesta2.raise_for_status()
+                data2 = respuesta2.json()
+                serie2 = data2.get("serie") or []
+                if serie2:
+                    return serie2[0].get("valor")
+                print(f"Sin datos en serie para {indicator} (último disponible)")
+                return None
+            except Exception as e2:
+                print(f"Hubo un error con la solicitud (sin fecha) para {indicator}: {e2}")
+                return None
+        except Exception as e:
+            print(f"Error inesperado obteniendo {indicator}: {e}")
+            return None
+
+    def get_currency_rate(self, currency: str, fecha: str = None) -> Optional[float]:
+        """Obtiene tasa de `currency` a CLP usando exchangerate.host. Mantiene la misma interfaz."""
+        try:
+            # exchangerate.host: https://api.exchangerate.host/convert?from=USD&to=CLP&date=YYYY-MM-DD
+            params = {"from": currency, "to": "CLP"}
+            if fecha:
+                params["date"] = fecha
+            url = "https://api.exchangerate.host/convert"
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            j = resp.json()
+            # campo 'result' contiene la conversión directa
+            result = j.get("result")
+            if result is None:
+                print(f"No se obtuvo tasa para {currency} en {fecha or 'hoy'}")
+                return None
+            print(f"El valor de {currency} en CLP es: {result}")
+            return result
+        except Exception as e:
+            print(f"Error obteniendo tasa de {currency}: {e}")
+            return None
+    def get_chilean_indicator(self, indicator: str, fecha: str = None) -> Optional[float]:
+        """Intenta obtener indicador desde Banco Central (si está configurado) y luego mindicador como fallback.
+
+        - Si la variable de entorno `BC_BASE_URL` está definida intentará una petición a esa URL
+          con la forma: {BC_BASE_URL}/{indicator}?date=YYYY-MM-DD
+        - Si no existe `BC_BASE_URL` o la respuesta no contiene datos esperados,
+          usará la lógica de `get_indicator` (mindicador con fallback fecha/no-fecha).
+        """
+        try:
+            fecha_param = fecha if fecha else None
+            bc_base = os.getenv("BC_BASE_URL")
+            if bc_base:
+                try:
+                    params = {}
+                    if fecha_param:
+                        params["date"] = fecha_param
+                    resp = requests.get(f"{bc_base.rstrip('/')}/{indicator}", params=params, timeout=10)
+                    resp.raise_for_status()
+                    j = resp.json()
+                    # Estructura esperada: similar a mindicador ('serie')
+                    if isinstance(j, dict) and j.get("serie"):
+                        s = j.get("serie") or []
+                        if s:
+                            return s[0].get("valor")
+                    # Alternativa: buscar campos comunes
+                    if isinstance(j, dict):
+                        # direct value
+                        for k in ("valor", "value", "resultado"):
+                            if k in j and isinstance(j[k], (int, float)):
+                                return j[k]
+                        # data list
+                        data_list = j.get("data") or j.get("datos") or []
+                        if isinstance(data_list, list) and data_list:
+                            first = data_list[0]
+                            if isinstance(first, dict):
+                                for k in ("valor", "value"):
+                                    if k in first:
+                                        return first.get(k)
+                except Exception:
+                    # si falla con BC, seguir al fallback
+                    pass
+
+            # Fallback: usar mindicador (get_indicator ya intenta con fecha y sin fecha)
+            return self.get_indicator(indicator, fecha)
+        except Exception as e:
+            print(f"Error obteniendo indicador chileno {indicator}: {e}")
+            return None
     def get_usd(self, fecha: str = None):
-        valor = self.get_indicator("dolar", fecha)
+        # Intentar obtener desde mindicador (dolar) / BC fallback
+        valor = self.get_chilean_indicator("dolar", fecha)
         print(f"El valor del dolar en CLP es: {valor}")
         return valor
     def get_eur(self, fecha: str = None):
-        valor = self.get_indicator("euro", fecha)
+        valor = self.get_chilean_indicator("euro", fecha)
         print(f"El valor del euro en CLP es: {valor}")
         return valor
 
     def get_uf(self, fecha: str = None):
-        valor = self.get_indicator("uf", fecha)
+        valor = self.get_chilean_indicator("uf", fecha)
         print(f"El valor de la UF en CLP es: {valor}")
         return valor
 
     def get_ivp(self, fecha: str = None):
-        valor = self.get_indicator("ivp", fecha)
+        valor = self.get_chilean_indicator("ivp", fecha)
         print(f"El valor del IVP en CLP es: {valor}")
         return valor
 
     def get_ipc(self, fecha: str = None):
-        valor = self.get_indicator("ipc", fecha)
+        valor = self.get_chilean_indicator("ipc", fecha)
         print(f"El valor del IPC es: {valor}")
         return valor
 
     def get_utm(self, fecha: str = None):
-        valor = self.get_indicator("utm", fecha)
+        valor = self.get_chilean_indicator("utm", fecha)
         print(f"El valor de la UTM es: {valor}")
         return valor
 
@@ -176,7 +274,7 @@ def _validate_date(date_str: Optional[str]) -> Optional[str]:
     for fmt in formats:
         try:
             dt = datetime.datetime.strptime(date_str, fmt)
-            return dt.strftime("%d-%m-%Y")
+            return dt.strftime("%Y-%m-%d")
         except Exception:
             continue
     return None
