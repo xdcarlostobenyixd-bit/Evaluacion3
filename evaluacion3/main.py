@@ -23,7 +23,7 @@ class Database:
         tables = [
             (
                 "CREATE TABLE USERS("
-                "id INTEGER PRIMARY KEY,"
+                "id NUMBER PRIMARY KEY,"
                 "username VARCHAR(32) UNIQUE,"
                 "password VARCHAR(128)"
                 ")"
@@ -377,6 +377,9 @@ def run_cli():
         password=os.getenv("ORACLE_PASSWORD"),
         dsn=os.getenv("ORACLE_DSN")
     )
+
+    print(db.username, db.password, db.dsn)
+
     finance = Finance()
 
     print("Bienvenido al CLI de indicadores")
@@ -403,6 +406,16 @@ def run_cli():
 
 
 if __name__ == "__main__":
+    load_dotenv()
+
+    db = Database(
+        username=os.getenv("ORACLE_USER"),
+        password=os.getenv("ORACLE_PASSWORD"),
+        dsn=os.getenv("ORACLE_DSN")
+    )
+
+    db.create_all_tables()
+    
     run_cli()
 
     """#Conectado a la base de datos a través de Oracle se debe registrar los datos consultados 
