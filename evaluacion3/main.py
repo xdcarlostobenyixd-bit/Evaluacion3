@@ -56,6 +56,7 @@ class Auth:
             sql= "SELECT * FROM USERS WHERE username = :username",
             parameters={"username": username}
         )
+        print("SELECT * FROM USERS WHERE username = :username", {"username": username}, resultado)
 
         if not resultado:
             print("No hay coincidencias")
@@ -98,37 +99,6 @@ class Auth:
             parameters=usuario
         )
         print("usuario registrado con exito")
-
-    @staticmethod
-    def login_local(username: str, password: str) -> Optional[int]:
-        """Lee users.json y valida credenciales sin SQL"""
-        try:
-            store_path = Path(__file__).parent / "users.json"
-            if not store_path.exists():
-                print("No hay coincidencias")
-                return None
-            with open(store_path, "r", encoding="utf-8") as f:
-                users = json.load(f)
-            for u in users:
-                if u.get("username") == username:
-                    try:
-                        hashed = bytes.fromhex(u.get("password", ""))
-                        if bcrypt.checkpw(password.encode("UTF-8"), hashed):
-                            print("Logeado correctamente")
-                            return int(u.get("id", 0))
-                        else:
-                            print("Contraseña incorrecta")
-                            return None
-                    except Exception as e:
-                        print(f"Error: {e}")
-                        return None
-            print("No hay coincidencias")
-            return None
-        except Exception as e:
-            print(f"Error: {e}")
-            return None
-
-# Integración y manejo de APIs (3.1.2)
 
 class Finance:
     def __init__(self, base_url: str = "https://mindicador.cl/api"):
@@ -331,7 +301,7 @@ def prompt_login(db: Database) -> Optional[int]:
     if not _validate_username(username) or not _validate_password(password):
         print("Credenciales con formato inválido")
         return None
-    user_id = Auth.login_local(username, password)
+    user_id = Auth.login(db, username, password)
     return user_id
 
 
@@ -415,7 +385,7 @@ if __name__ == "__main__":
     )
 
     db.create_all_tables()
-    
+
     run_cli()
 
     """#Conectado a la base de datos a través de Oracle se debe registrar los datos consultados 
